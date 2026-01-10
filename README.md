@@ -1,9 +1,9 @@
-# SpawnMonitor
+# SpawnMonitor **Version:** v1.4.2
 
 **Originally created by Alektra <Lederhosen>**
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Support-Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/shablagu)
-**Version:** v1.4.2
+
 
 **Description:**  
 A full-featured named camp monitor for EverQuest using MQ2 and ImGui. Tracks NPC spawns based on exact or partial name matching, supports multi-named monitoring, audio alerts, and a center-screen HUD overlay for instant notifications.
