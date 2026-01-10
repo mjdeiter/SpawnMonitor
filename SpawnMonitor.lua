@@ -1,0 +1,724 @@
+-- SpawnMonitor.lua
+-- v1.4.2 (Fixed ImGui widget return value handling)
+-- Full featured named camp monitor
+
+local mq = require('mq')
+local ImGui = require('ImGui')
+
+local VERSION = 'v1.4.2'
+local INI_FILE = mq.configDir .. '/SpawnMonitor.ini'
+
+-- FSM States for individual nameds
+local STATUS_DETECTED = 'detected'
+local STATUS_MONITORING = 'monitoring'
+
+local state = {
+    armed = false,
+    radius = 60,
+    zRange = 10,
+    audioAlert = 'beep',
+    soundFile = 'exclamation.wav',
+    currentZone = '',
+    currentProfile = 'default',
+    profiles = {
+        default = {
+            exactList = {},
+            partialList = {}
+        }
+    },
+    trackedNameds = {},
+    exactInput = '',
+    partialInput = '',
+    profileInput = '',
+    scanCooldown = 0,
+    debugLog = {},
+    
+    -- Center-screen overlay
+    centerMessage = '',
+    centerUntil = 0,
+    centerColor = {1.0, 0.0, 0.0, 1.0}, -- RED for alert
+}
+
+local openGUI = true
+
+-- ============================================================================
+-- UTILITY FUNCTIONS
+-- ============================================================================
+
+local function addDebugLog(msg)
+    table.insert(state.debugLog, 1, os.date('%H:%M:%S') .. ' - ' .. msg)
+    if #state.debugLog > 10 then
+        table.remove(state.debugLog)
+    end
+    print('[DEBUG] ' .. msg)
+end
+
+local function trim(s)
+    if type(s) ~= 'string' then return '' end
+    return s:match('^%s*(.-)%s*$')
+end
+
+local function tooltip(text)
+    if ImGui.IsItemHovered() then
+        ImGui.BeginTooltip()
+        ImGui.Text(text)
+        ImGui.EndTooltip()
+    end
+end
+
+-- Robust InputText wrapper (from working v1.0.2)
+local function InputTextValue(label, current, maxlen)
+    maxlen = maxlen or 64
+    local a, b = ImGui.InputText(label, current, maxlen)
+
+    if type(a) == "boolean" then
+        -- (changed, value)
+        return b or current
+    end
+
+    -- (value) or (value, changed)
+    if type(a) == "string" then
+        return a
+    end
+
+    return current
+end
+
+-- ============================================================================
+-- INI PERSISTENCE
+-- ============================================================================
+
+local function saveAllToINI()
+    local lines = {}
+    
+    table.insert(lines, '[Settings]')
+    table.insert(lines, 'Radius=' .. tostring(state.radius))
+    table.insert(lines, 'ZRange=' .. tostring(state.zRange))
+    table.insert(lines, 'AudioAlert=' .. state.audioAlert)
+    table.insert(lines, 'SoundFile=' .. state.soundFile)
+    table.insert(lines, 'CurrentProfile=' .. state.currentProfile)
+    table.insert(lines, '')
+    
+    for profileName, profile in pairs(state.profiles) do
+        table.insert(lines, '[Profile_' .. profileName .. ']')
+        table.insert(lines, 'ExactList=' .. table.concat(profile.exactList, '|'))
+        table.insert(lines, 'PartialList=' .. table.concat(profile.partialList, '|'))
+        table.insert(lines, '')
+    end
+    
+    local file = io.open(INI_FILE, 'w')
+    if file then
+        file:write(table.concat(lines, '\n'))
+        file:close()
+        addDebugLog('Settings saved to INI')
+        return true
+    else
+        print('ERROR: Could not write to ' .. INI_FILE)
+        return false
+    end
+end
+
+local function loadSettings()
+    local radius = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('Radius').Value()
+    if radius and radius ~= 'NULL' then
+        state.radius = tonumber(radius) or 60
+    end
+    
+    local zRange = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('ZRange').Value()
+    if zRange and zRange ~= 'NULL' then
+        state.zRange = tonumber(zRange) or 10
+    end
+    
+    local audio = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('AudioAlert').Value()
+    if audio and audio ~= 'NULL' then
+        state.audioAlert = audio
+    end
+    
+    local sound = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('SoundFile').Value()
+    if sound and sound ~= 'NULL' then
+        state.soundFile = sound
+    end
+    
+    local profile = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('CurrentProfile').Value()
+    if profile and profile ~= 'NULL' then
+        state.currentProfile = profile
+    end
+end
+
+local function loadProfile(profileName)
+    local section = 'Profile_' .. profileName
+    
+    if not state.profiles[profileName] then
+        state.profiles[profileName] = {
+            exactList = {},
+            partialList = {}
+        }
+    end
+    
+    local profile = state.profiles[profileName]
+    
+    local exactStr = mq.TLO.Ini.File(INI_FILE).Section(section).Key('ExactList').Value()
+    if exactStr and exactStr ~= 'NULL' and exactStr ~= '' then
+        profile.exactList = {}
+        for name in string.gmatch(exactStr, '[^|]+') do
+            table.insert(profile.exactList, trim(name))
+        end
+    end
+    
+    local partialStr = mq.TLO.Ini.File(INI_FILE).Section(section).Key('PartialList').Value()
+    if partialStr and partialStr ~= 'NULL' and partialStr ~= '' then
+        profile.partialList = {}
+        for name in string.gmatch(partialStr, '[^|]+') do
+            table.insert(profile.partialList, trim(name))
+        end
+    end
+end
+
+local function loadAllProfiles()
+    local iniData = mq.TLO.Ini.File(INI_FILE)
+    if not iniData() then return end
+    
+    for i = 1, 100 do
+        local section = iniData.Section(i)()
+        if not section or section == 'NULL' then break end
+        
+        if section:match('^Profile_') then
+            local profileName = section:gsub('^Profile_', '')
+            loadProfile(profileName)
+        end
+    end
+end
+
+-- ============================================================================
+-- CENTER-SCREEN OVERLAY (copied from Group_Alert pattern)
+-- ============================================================================
+
+local function fireCenterOverlay(msg, seconds, color)
+    state.centerMessage = msg or ''
+    state.centerUntil = os.time() + (seconds or 3)
+    
+    if type(color) == 'table' then
+        state.centerColor = color
+    end
+end
+
+-- ============================================================================
+-- AUDIO ALERTS
+-- ============================================================================
+
+local function playAlert(namedName)
+    -- Audio
+    if state.audioAlert == 'beep' then
+        mq.cmd('/beep')
+    elseif state.audioAlert == 'sound' and state.soundFile ~= '' then
+        mq.cmdf('/playsound %s', state.soundFile)
+    end
+    
+    -- Center-screen overlay (BIG HUD message)
+    fireCenterOverlay('*** NAMED UP: ' .. namedName .. ' ***', 5, {1.0, 0.0, 0.0, 1.0})
+end
+
+-- ============================================================================
+-- MATCHING LOGIC
+-- ============================================================================
+
+local function matches(name)
+    local profile = state.profiles[state.currentProfile]
+    if not profile then return false end
+    
+    local lname = string.lower(name)
+    
+    for _, e in ipairs(profile.exactList) do
+        if lname == string.lower(e) then return true end
+    end
+    
+    for _, p in ipairs(profile.partialList) do
+        if lname:find(string.lower(p), 1, true) then return true end
+    end
+    
+    return false
+end
+
+-- ============================================================================
+-- TARGET SCANNING (DEBUG)
+-- ============================================================================
+
+local function scanCurrentTarget()
+    local target = mq.TLO.Target
+    if not target() then
+        addDebugLog('No target selected')
+        return
+    end
+    
+    local rawName = target.Name()
+    local cleanName = target.CleanName()
+    local displayName = target.DisplayName()
+    local id = target.ID()
+    local distance = target.Distance()
+    
+    addDebugLog(string.format('TARGET SCAN:'))
+    addDebugLog(string.format('  Name (raw): "%s" (type: %s)', tostring(rawName), type(rawName)))
+    addDebugLog(string.format('  CleanName: "%s" (type: %s)', tostring(cleanName), type(cleanName)))
+    addDebugLog(string.format('  DisplayName: "%s" (type: %s)', tostring(displayName), type(displayName)))
+    addDebugLog(string.format('  ID: %s (type: %s)', tostring(id), type(id)))
+    addDebugLog(string.format('  Distance: %s', tostring(distance)))
+    
+    mq.cmdf('/echo Name=[%s] CleanName=[%s] DisplayName=[%s] ID=%s', tostring(rawName), tostring(cleanName), tostring(displayName), tostring(id))
+end
+
+-- ============================================================================
+-- MULTI-NAMED TRACKING
+-- ============================================================================
+
+local function isSpawnInRange(spawnID)
+    local spawn = mq.TLO.Spawn(spawnID)
+    if not spawn() then return false end
+    
+    local distance = spawn.Distance() or 999999
+    local zDiff = math.abs((spawn.Z() or 0) - (mq.TLO.Me.Z() or 0))
+    
+    return distance <= state.radius and zDiff <= state.zRange
+end
+
+local function updateTrackedNameds()
+    for id, data in pairs(state.trackedNameds) do
+        if not isSpawnInRange(id) then
+            state.trackedNameds[id] = nil
+        end
+    end
+end
+
+local function scan()
+    if not state.armed then return end
+    
+    if state.scanCooldown > 0 then
+        state.scanCooldown = state.scanCooldown - 1
+        return
+    end
+    state.scanCooldown = 2
+    
+    updateTrackedNameds()
+    
+    local count = mq.TLO.SpawnCount('npc radius ' .. state.radius .. ' zradius ' .. state.zRange)()
+    if not count or count == 0 then return end
+    
+    for i = 1, count do
+        local sp = mq.TLO.NearestSpawn(i, 'npc radius ' .. state.radius .. ' zradius ' .. state.zRange)
+        if sp() then
+            -- Use .Name() for system spawn name (e.g. "Defender_Karrik000")
+            local name = sp.Name()
+            local id = sp.ID()
+            
+            -- Robust validation: ensure we have valid string name and numeric ID
+            if name and type(name) == 'string' and name ~= '' and id and type(id) == 'number' then
+                if matches(name) and not state.trackedNameds[id] then
+                    -- Store CleanName for display, but match against raw Name
+                    local displayName = sp.CleanName() or name
+                    
+                    state.trackedNameds[id] = {
+                        name = displayName,
+                        rawName = name,
+                        firstSeen = os.time(),
+                        status = STATUS_MONITORING
+                    }
+                    
+                    addDebugLog(string.format('NAMED DETECTED: %s [%s] (ID: %d)', displayName, name, id))
+                    mq.cmdf('/echo \\a-t*** NAMED UP: %s (ID: %d) ***\\a-x', displayName, id)
+                    playAlert(displayName)
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================================
+-- UI RENDERING
+-- ============================================================================
+
+local function drawMonitorTab()
+    ImGui.Text('Status: ')
+    ImGui.SameLine()
+    
+    local namedCount = 0
+    for _ in pairs(state.trackedNameds) do namedCount = namedCount + 1 end
+    
+    if namedCount > 0 then
+        ImGui.TextColored(1, 0, 0, 1, string.format('%d Named(s) Detected', namedCount))
+    else
+        ImGui.TextColored(0, 1, 0, 1, 'Waiting for nameds')
+    end
+    
+    ImGui.Separator()
+    
+    if namedCount > 0 then
+        ImGui.TextColored(1, 1, 0, 1, 'Active Nameds:')
+        
+        -- Build snapshot of tracked nameds to avoid iteration issues
+        local snapshot = {}
+        for id, data in pairs(state.trackedNameds) do
+            if data and data.name and data.firstSeen then
+                table.insert(snapshot, {
+                    id = id,
+                    name = data.name,
+                    rawName = data.rawName,
+                    firstSeen = data.firstSeen
+                })
+            end
+        end
+        
+        -- Render from snapshot
+        for _, entry in ipairs(snapshot) do
+            local elapsed = os.time() - entry.firstSeen
+            local displayName = tostring(entry.name)
+            local rawName = entry.rawName and (' [' .. entry.rawName .. ']') or ''
+            local displayID = tonumber(entry.id) or 0
+            ImGui.BulletText(string.format('%s%s (ID: %d) - %ds ago', displayName, rawName, displayID, elapsed))
+        end
+    else
+        ImGui.TextDisabled('No nameds currently detected')
+    end
+    
+    ImGui.Separator()
+    
+    ImGui.Text(string.format('Scan Range: %d radius, +/-%d Z', state.radius, state.zRange))
+    ImGui.Text('Profile: ' .. state.currentProfile)
+    ImGui.Text('Audio: ' .. state.audioAlert)
+    
+    ImGui.Separator()
+    
+    local armed = ImGui.Checkbox('Armed##armed', state.armed)
+    if type(armed) == 'boolean' then
+        state.armed = armed
+    end
+    tooltip('When armed, the script actively scans for nameds')
+    
+    ImGui.SameLine()
+    
+    if ImGui.Button('Clear All Detections') then
+        state.trackedNameds = {}
+    end
+    tooltip('Clear all currently tracked nameds')
+    
+    ImGui.Separator()
+    
+    -- DEBUG SECTION
+    ImGui.TextColored(1, 0.5, 0, 1, 'Debug Tools:')
+    if ImGui.Button('Scan Current Target') then
+        scanCurrentTarget()
+    end
+    tooltip('Debug: Show all name variants for your current target')
+    
+    ImGui.SameLine()
+    if ImGui.Button('Test Center Alert') then
+        fireCenterOverlay('*** TEST ALERT: This is a test! ***', 3, {1.0, 0.0, 0.0, 1.0})
+    end
+    tooltip('Test the center-screen alert overlay')
+    
+    if #state.debugLog > 0 then
+        ImGui.Separator()
+        ImGui.TextColored(0.7, 0.7, 0.7, 1, 'Recent Debug Log:')
+        for _, log in ipairs(state.debugLog) do
+            ImGui.TextColored(0.5, 0.5, 0.5, 1, log)
+        end
+    end
+end
+
+local function drawConfigTab()
+    local profile = state.profiles[state.currentProfile]
+    if not profile then return end
+    
+    ImGui.TextColored(1, 1, 0, 1, 'Configuration')
+    ImGui.Text('Profile: ' .. state.currentProfile)
+    
+    if state.armed then
+        ImGui.TextColored(1, 0.5, 0, 1, 'Disarm to edit watch lists')
+        return
+    end
+    
+    ImGui.Separator()
+    
+    ImGui.Text('Scan Range Settings:')
+    local r = ImGui.SliderInt('Radius##radius', state.radius, 10, 200)
+    if type(r) == 'number' then
+        state.radius = r
+    end
+    tooltip('Horizontal detection radius')
+    
+    local z = ImGui.SliderInt('Z Range##zrange', state.zRange, 5, 50)
+    if type(z) == 'number' then
+        state.zRange = z
+    end
+    tooltip('Vertical detection range')
+    
+    ImGui.Separator()
+    
+    ImGui.Text('Audio Alert:')
+    if ImGui.RadioButton('Beep##beep', state.audioAlert == 'beep') then
+        state.audioAlert = 'beep'
+    end
+    ImGui.SameLine()
+    if ImGui.RadioButton('Sound##sound', state.audioAlert == 'sound') then
+        state.audioAlert = 'sound'
+    end
+    ImGui.SameLine()
+    if ImGui.RadioButton('None##none', state.audioAlert == 'none') then
+        state.audioAlert = 'none'
+    end
+    
+    if state.audioAlert == 'sound' then
+        state.soundFile = InputTextValue('Sound File##soundfile', state.soundFile, 64)
+        tooltip('Sound file in MQ/resources/sounds folder')
+    end
+    
+    ImGui.Separator()
+    
+    -- EXACT MATCHES (using working v1.0.2 pattern)
+    ImGui.TextColored(0.5, 1, 1, 1, 'Exact Match Names:')
+    
+    if #profile.exactList > 0 then
+        for i, name in ipairs(profile.exactList) do
+            ImGui.BulletText(name)
+            ImGui.SameLine()
+            ImGui.PushID('exact_del_' .. i)
+            if ImGui.SmallButton('X') then
+                table.remove(profile.exactList, i)
+                saveAllToINI()
+                addDebugLog('Removed exact match: ' .. name)
+            end
+            ImGui.PopID()
+        end
+    else
+        ImGui.TextDisabled('  (no exact matches defined)')
+    end
+    
+    state.exactInput = InputTextValue('##exactinput', state.exactInput, 64)
+    tooltip('Name must match exactly (use Scan Target button to see actual name)')
+    
+    ImGui.SameLine()
+    if ImGui.Button('Add##addexact') then
+        local val = trim(state.exactInput)
+        if val ~= '' then
+            table.insert(profile.exactList, val)
+            state.exactInput = ''
+            saveAllToINI()
+            addDebugLog('Added exact match: ' .. val)
+        end
+    end
+    
+    ImGui.Separator()
+    
+    -- PARTIAL MATCHES (using working v1.0.2 pattern)
+    ImGui.TextColored(0.5, 1, 1, 1, 'Partial Match Patterns:')
+    
+    if #profile.partialList > 0 then
+        for i, name in ipairs(profile.partialList) do
+            ImGui.BulletText(name)
+            ImGui.SameLine()
+            ImGui.PushID('partial_del_' .. i)
+            if ImGui.SmallButton('X') then
+                table.remove(profile.partialList, i)
+                saveAllToINI()
+                addDebugLog('Removed partial match: ' .. name)
+            end
+            ImGui.PopID()
+        end
+    else
+        ImGui.TextDisabled('  (no partial matches defined)')
+    end
+    
+    state.partialInput = InputTextValue('##partialinput', state.partialInput, 64)
+    tooltip('Matches any NPC name containing this text')
+    
+    ImGui.SameLine()
+    if ImGui.Button('Add##addpartial') then
+        local val = trim(state.partialInput)
+        if val ~= '' then
+            table.insert(profile.partialList, val)
+            state.partialInput = ''
+            saveAllToINI()
+            addDebugLog('Added partial match: ' .. val)
+        end
+    end
+    
+    ImGui.Separator()
+    
+    if ImGui.Button('Save Settings') then
+        saveAllToINI()
+    end
+    tooltip('Save all settings and current profile to INI file')
+end
+
+local function drawProfilesTab()
+    ImGui.TextColored(1, 1, 0, 1, 'Zone Profile Management')
+    
+    ImGui.Text('Current Zone: ' .. (state.currentZone ~= '' and state.currentZone or 'Unknown'))
+    ImGui.Text('Active Profile: ' .. state.currentProfile)
+    
+    ImGui.Separator()
+    
+    ImGui.Text('Available Profiles:')
+    for name, _ in pairs(state.profiles) do
+        local isActive = (name == state.currentProfile)
+        if isActive then
+            ImGui.TextColored(0, 1, 0, 1, '> ' .. name)
+        else
+            ImGui.Text('  ' .. name)
+            ImGui.SameLine()
+            if ImGui.SmallButton('Switch##switch_' .. name) then
+                state.currentProfile = name
+                saveAllToINI()
+            end
+            ImGui.SameLine()
+            if name ~= 'default' and ImGui.SmallButton('Delete##del_' .. name) then
+                state.profiles[name] = nil
+                if state.currentProfile == name then
+                    state.currentProfile = 'default'
+                end
+                saveAllToINI()
+            end
+        end
+    end
+    
+    ImGui.Separator()
+    
+    ImGui.Text('Create New Profile:')
+    state.profileInput = InputTextValue('##profileinput', state.profileInput, 64)
+    
+    ImGui.SameLine()
+    if ImGui.Button('Create') then
+        local val = trim(state.profileInput)
+        if val ~= '' and not state.profiles[val] then
+            state.profiles[val] = {
+                exactList = {},
+                partialList = {}
+            }
+            state.currentProfile = val
+            state.profileInput = ''
+            saveAllToINI()
+            addDebugLog('Created profile: ' .. val)
+        end
+    end
+    
+    ImGui.Separator()
+    
+    if ImGui.Button('Use Zone Name as Profile') then
+        if state.currentZone ~= '' then
+            state.currentProfile = state.currentZone
+            if not state.profiles[state.currentZone] then
+                state.profiles[state.currentZone] = {
+                    exactList = {},
+                    partialList = {}
+                }
+            end
+            saveAllToINI()
+        end
+    end
+    tooltip('Create/switch to profile named after current zone')
+end
+
+local function draw()
+    -- CENTER-SCREEN OVERLAY (always draw first, even if main window closed)
+    if state.centerMessage ~= '' and os.time() < (state.centerUntil or 0) then
+        local io = ImGui.GetIO()
+        local x = io.DisplaySize.x / 2
+        local y = io.DisplaySize.y * 0.20
+        
+        -- No background (EQ-style)
+        ImGui.SetNextWindowBgAlpha(0.0)
+        ImGui.SetNextWindowPos(x, y, ImGuiCond.Always, 0.5, 0.5)
+        
+        ImGui.Begin('##NamedCenterOverlay', nil,
+            bit32.bor(ImGuiWindowFlags.NoDecoration, ImGuiWindowFlags.AlwaysAutoResize,
+                     ImGuiWindowFlags.NoSavedSettings, ImGuiWindowFlags.NoFocusOnAppearing,
+                     ImGuiWindowFlags.NoNav, ImGuiWindowFlags.NoInputs))
+        
+        ImGui.SetWindowFontScale(2.5)
+        
+        local msg = state.centerMessage or ''
+        local cx, cy = ImGui.GetCursorPos()
+        
+        -- Shadow
+        ImGui.SetCursorPos(cx + 2, cy + 2)
+        ImGui.TextColored(0.0, 0.0, 0.0, 1.0, msg)
+        
+        -- Foreground (red for alert)
+        local c = state.centerColor
+        ImGui.SetCursorPos(cx, cy)
+        ImGui.TextColored(c[1], c[2], c[3], c[4], msg)
+        
+        ImGui.SetWindowFontScale(1.0)
+        ImGui.End()
+    end
+    
+    -- MAIN WINDOW
+    openGUI, shouldShow = ImGui.Begin('Named Camp Monitor ' .. VERSION, openGUI)
+    
+    if not shouldShow then
+        ImGui.End()
+        return
+    end
+    
+    if ImGui.BeginTabBar('MainTabs') then
+        if ImGui.BeginTabItem('Monitor') then
+            drawMonitorTab()
+            ImGui.EndTabItem()
+        end
+        
+        if ImGui.BeginTabItem('Config') then
+            drawConfigTab()
+            ImGui.EndTabItem()
+        end
+        
+        if ImGui.BeginTabItem('Profiles') then
+            drawProfilesTab()
+            ImGui.EndTabItem()
+        end
+        
+        ImGui.EndTabBar()
+    end
+    
+    ImGui.End()
+    
+    if not openGUI then
+        mq.exit()
+    end
+end
+
+-- ============================================================================
+-- INITIALIZATION & MAIN LOOP
+-- ============================================================================
+
+local function initialize()
+    loadSettings()
+    loadAllProfiles()
+    
+    if not state.profiles[state.currentProfile] then
+        state.profiles[state.currentProfile] = {
+            exactList = {},
+            partialList = {}
+        }
+    end
+    
+    loadProfile(state.currentProfile)
+    
+    state.currentZone = mq.TLO.Zone.ShortName() or ''
+    
+    print('SpawnMonitor v' .. VERSION .. ' initialized')
+    print('Current zone: ' .. state.currentZone)
+    print('Active profile: ' .. state.currentProfile)
+    addDebugLog('Script initialized')
+end
+
+mq.imgui.init('SpawnMonitorUI', draw)
+initialize()
+
+while openGUI do
+    local currentZone = mq.TLO.Zone.ShortName() or ''
+    if currentZone ~= state.currentZone then
+        state.currentZone = currentZone
+    end
+    
+    scan()
+    
+    mq.delay(500)
+end
