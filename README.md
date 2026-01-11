@@ -1,4 +1,4 @@
-# SpawnMonitor **Version:** v1.4.2
+# SpawnMonitor
 
 **Originally created by Alektra <Lederhosen>**
 
@@ -47,11 +47,4 @@ Settings and profiles are saved to `SpawnMonitor.ini` in your MQ2 config directo
 ---
 
 ## License
-[MIT License](LICENSE)
-
----
-
-## Changelog
-**v1.4.2** – Fixed ImGui widget return value handling  
-**v1.4.1** – Minor bug fixes  
-**v1.4.0** – Initial ImGui GUI implementation, multi-named tracking  
+[MIT License](LICENSE) 
