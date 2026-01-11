@@ -1,11 +1,11 @@
 -- SpawnMonitor.lua
--- v1.5.2 (Fixed SliderInt auto-save spam)
--- Full featured spawn monitor
+-- v1.6.0 (Increased detection range for zone-wide monitoring)
+-- Full featured named camp monitor
 
 local mq = require('mq')
 local ImGui = require('ImGui')
 
-local VERSION = 'v1.5.2'
+local VERSION = 'v1.6.0'
 local INI_FILE = mq.configDir .. '/SpawnMonitor.ini'
 
 -- FSM States for individual nameds
@@ -14,8 +14,8 @@ local STATUS_MONITORING = 'monitoring'
 
 local state = {
     armed = false,
-    radius = 60,
-    zRange = 10,
+    radius = 500,        -- Increased default for zone-wide detection
+    zRange = 50,         -- Increased default for multi-floor zones
     audioAlert = 'beep',
     soundFile = 'exclamation.wav',
     currentZone = '',
@@ -124,12 +124,12 @@ end
 local function loadSettings()
     local radius = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('Radius').Value()
     if radius and radius ~= 'NULL' then
-        state.radius = tonumber(radius) or 60
+        state.radius = tonumber(radius) or 500
     end
     
     local zRange = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('ZRange').Value()
     if zRange and zRange ~= 'NULL' then
-        state.zRange = tonumber(zRange) or 10
+        state.zRange = tonumber(zRange) or 50
     end
     
     local audio = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('AudioAlert').Value()
@@ -515,17 +515,17 @@ local function drawConfigTab()
     ImGui.Separator()
     
     ImGui.Text('Scan Range Settings:')
-    local r = ImGui.SliderInt('Radius##radius', state.radius, 10, 200)
+    local r = ImGui.SliderInt('Radius##radius', state.radius, 50, 5000)
     if type(r) == 'number' and r ~= state.radius then
         state.radius = r
     end
-    tooltip('Horizontal detection radius')
+    tooltip('Horizontal detection radius (50-5000 units)')
     
-    local z = ImGui.SliderInt('Z Range##zrange', state.zRange, 5, 50)
+    local z = ImGui.SliderInt('Z Range##zrange', state.zRange, 10, 500)
     if type(z) == 'number' and z ~= state.zRange then
         state.zRange = z
     end
-    tooltip('Vertical detection range')
+    tooltip('Vertical detection range (10-500 units, for multi-floor zones)')
     
     ImGui.Separator()
     
@@ -750,7 +750,7 @@ local function draw()
     end
     
     -- MAIN WINDOW
-    openGUI, shouldShow = ImGui.Begin('Named Camp Monitor ' .. VERSION, openGUI)
+    openGUI, shouldShow = ImGui.Begin('Spawn Monitor ' .. VERSION, openGUI)
     
     if not shouldShow then
         ImGui.End()
