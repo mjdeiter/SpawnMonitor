@@ -1,12 +1,12 @@
--- NamedCampMonitor.lua
+-- SpawnMonitor.lua
 -- v1.5.2 (Fixed SliderInt auto-save spam)
--- Full featured named camp monitor
+-- Full featured spawn monitor
 
 local mq = require('mq')
 local ImGui = require('ImGui')
 
 local VERSION = 'v1.5.2'
-local INI_FILE = mq.configDir .. '/NamedCampMonitor.ini'
+local INI_FILE = mq.configDir .. '/SpawnMonitor.ini'
 
 -- FSM States for individual nameds
 local STATUS_DETECTED = 'detected'
@@ -802,13 +802,13 @@ local function initialize()
     
     state.currentZone = mq.TLO.Zone.ShortName() or ''
     
-    print('NamedCampMonitor v' .. VERSION .. ' initialized')
+    print('SpawnMonitor v' .. VERSION .. ' initialized')
     print('Current zone: ' .. state.currentZone)
     print('Active profile: ' .. state.currentProfile)
     addDebugLog('Script initialized')
 end
 
-mq.imgui.init('NamedCampMonitorUI', draw)
+mq.imgui.init('SpawnMonitorUI', draw)
 initialize()
 
 while openGUI do
