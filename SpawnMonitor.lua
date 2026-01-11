@@ -1,12 +1,12 @@
--- SpawnMonitor.lua
--- v1.4.2 (Fixed ImGui widget return value handling)
+-- NamedCampMonitor.lua
+-- v1.5.2 (Fixed SliderInt auto-save spam)
 -- Full featured named camp monitor
 
 local mq = require('mq')
 local ImGui = require('ImGui')
 
-local VERSION = 'v1.4.2'
-local INI_FILE = mq.configDir .. '/SpawnMonitor.ini'
+local VERSION = 'v1.5.2'
+local INI_FILE = mq.configDir .. '/NamedCampMonitor.ini'
 
 -- FSM States for individual nameds
 local STATUS_DETECTED = 'detected'
@@ -33,10 +33,11 @@ local state = {
     scanCooldown = 0,
     debugLog = {},
     
-    -- Center-screen overlay
-    centerMessage = '',
-    centerUntil = 0,
-    centerColor = {1.0, 0.0, 0.0, 1.0}, -- RED for alert
+    -- HUD Alert Queue (FIFO, bounded)
+    hudQueue = {},           -- pending alerts
+    activeHUD = nil,         -- currently displayed alert {msg, color, expiresAt}
+    hudDisplayTime = 4,      -- seconds per alert
+    hudMaxQueue = 5,         -- max queued alerts
 }
 
 local openGUI = true
@@ -97,6 +98,8 @@ local function saveAllToINI()
     table.insert(lines, 'AudioAlert=' .. state.audioAlert)
     table.insert(lines, 'SoundFile=' .. state.soundFile)
     table.insert(lines, 'CurrentProfile=' .. state.currentProfile)
+    table.insert(lines, 'HUDDisplayTime=' .. tostring(state.hudDisplayTime))
+    table.insert(lines, 'HUDMaxQueue=' .. tostring(state.hudMaxQueue))
     table.insert(lines, '')
     
     for profileName, profile in pairs(state.profiles) do
@@ -142,6 +145,16 @@ local function loadSettings()
     local profile = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('CurrentProfile').Value()
     if profile and profile ~= 'NULL' then
         state.currentProfile = profile
+    end
+    
+    local hudTime = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('HUDDisplayTime').Value()
+    if hudTime and hudTime ~= 'NULL' then
+        state.hudDisplayTime = tonumber(hudTime) or 4
+    end
+    
+    local hudMax = mq.TLO.Ini.File(INI_FILE).Section('Settings').Key('HUDMaxQueue').Value()
+    if hudMax and hudMax ~= 'NULL' then
+        state.hudMaxQueue = tonumber(hudMax) or 5
     end
 end
 
@@ -190,15 +203,55 @@ local function loadAllProfiles()
 end
 
 -- ============================================================================
--- CENTER-SCREEN OVERLAY (copied from Group_Alert pattern)
+-- HUD ALERT QUEUE (bounded FIFO, one-at-a-time display)
 -- ============================================================================
 
-local function fireCenterOverlay(msg, seconds, color)
-    state.centerMessage = msg or ''
-    state.centerUntil = os.time() + (seconds or 3)
+-- Enqueue a new alert (with duplicate suppression)
+local function enqueueHUDAlert(msg, color)
+    color = color or {1.0, 0.0, 0.0, 1.0}
     
-    if type(color) == 'table' then
-        state.centerColor = color
+    -- Check if already active
+    if state.activeHUD and state.activeHUD.msg == msg then
+        return
+    end
+    
+    -- Check if already queued
+    for _, alert in ipairs(state.hudQueue) do
+        if alert.msg == msg then
+            return
+        end
+    end
+    
+    -- Enforce queue limit (drop oldest if full)
+    if #state.hudQueue >= state.hudMaxQueue then
+        table.remove(state.hudQueue, 1)
+        addDebugLog('HUD queue full, dropped oldest alert')
+    end
+    
+    -- Add to queue
+    table.insert(state.hudQueue, {msg = msg, color = color})
+    addDebugLog(string.format('Enqueued HUD alert: %s (queue size: %d)', msg, #state.hudQueue))
+end
+
+-- Update HUD state (call from main loop)
+local function updateHUDQueue()
+    local now = os.time()
+    
+    -- Clear expired active HUD
+    if state.activeHUD and now >= state.activeHUD.expiresAt then
+        addDebugLog('HUD alert expired: ' .. state.activeHUD.msg)
+        state.activeHUD = nil
+    end
+    
+    -- Activate next queued alert if none active
+    if not state.activeHUD and #state.hudQueue > 0 then
+        local nextAlert = table.remove(state.hudQueue, 1)
+        state.activeHUD = {
+            msg = nextAlert.msg,
+            color = nextAlert.color,
+            expiresAt = now + state.hudDisplayTime
+        }
+        addDebugLog(string.format('Activated HUD alert: %s (remaining in queue: %d)', nextAlert.msg, #state.hudQueue))
     end
 end
 
@@ -214,8 +267,8 @@ local function playAlert(namedName)
         mq.cmdf('/playsound %s', state.soundFile)
     end
     
-    -- Center-screen overlay (BIG HUD message)
-    fireCenterOverlay('*** NAMED UP: ' .. namedName .. ' ***', 5, {1.0, 0.0, 0.0, 1.0})
+    -- Enqueue HUD alert (does not overwrite active/queued alerts)
+    enqueueHUDAlert('*** NAMED UP: ' .. namedName .. ' ***', {1.0, 0.0, 0.0, 1.0})
 end
 
 -- ============================================================================
@@ -410,15 +463,39 @@ local function drawMonitorTab()
     
     ImGui.SameLine()
     if ImGui.Button('Test Center Alert') then
-        fireCenterOverlay('*** TEST ALERT: This is a test! ***', 3, {1.0, 0.0, 0.0, 1.0})
+        enqueueHUDAlert('*** TEST ALERT: This is a test! ***', {1.0, 0.0, 0.0, 1.0})
     end
     tooltip('Test the center-screen alert overlay')
+    
+    ImGui.SameLine()
+    if ImGui.Button('Test Multi-Alert') then
+        enqueueHUDAlert('*** ALERT 1: First Named ***', {1.0, 0.0, 0.0, 1.0})
+        enqueueHUDAlert('*** ALERT 2: Second Named ***', {1.0, 0.5, 0.0, 1.0})
+        enqueueHUDAlert('*** ALERT 3: Third Named ***', {1.0, 1.0, 0.0, 1.0})
+    end
+    tooltip('Test multiple alerts queuing')
     
     if #state.debugLog > 0 then
         ImGui.Separator()
         ImGui.TextColored(0.7, 0.7, 0.7, 1, 'Recent Debug Log:')
         for _, log in ipairs(state.debugLog) do
             ImGui.TextColored(0.5, 0.5, 0.5, 1, log)
+        end
+    end
+    
+    -- HUD Queue Status
+    if state.activeHUD or #state.hudQueue > 0 then
+        ImGui.Separator()
+        ImGui.TextColored(1, 1, 0, 1, 'HUD Alert Queue:')
+        if state.activeHUD then
+            local remaining = state.activeHUD.expiresAt - os.time()
+            ImGui.TextColored(0, 1, 0, 1, string.format('Active: %s (%ds)', state.activeHUD.msg, remaining))
+        end
+        if #state.hudQueue > 0 then
+            ImGui.Text(string.format('Queued: %d alert(s)', #state.hudQueue))
+            for i, alert in ipairs(state.hudQueue) do
+                ImGui.BulletText(string.format('%d: %s', i, alert.msg))
+            end
         end
     end
 end
@@ -439,13 +516,13 @@ local function drawConfigTab()
     
     ImGui.Text('Scan Range Settings:')
     local r = ImGui.SliderInt('Radius##radius', state.radius, 10, 200)
-    if type(r) == 'number' then
+    if type(r) == 'number' and r ~= state.radius then
         state.radius = r
     end
     tooltip('Horizontal detection radius')
     
     local z = ImGui.SliderInt('Z Range##zrange', state.zRange, 5, 50)
-    if type(z) == 'number' then
+    if type(z) == 'number' and z ~= state.zRange then
         state.zRange = z
     end
     tooltip('Vertical detection range')
@@ -469,6 +546,25 @@ local function drawConfigTab()
         state.soundFile = InputTextValue('Sound File##soundfile', state.soundFile, 64)
         tooltip('Sound file in MQ/resources/sounds folder')
     end
+    
+    ImGui.Separator()
+    
+    ImGui.Text('HUD Alert Settings:')
+    local hudTime = ImGui.SliderInt('Alert Display Time (sec)##hudtime', state.hudDisplayTime, 2, 10)
+    if type(hudTime) == 'number' and hudTime ~= state.hudDisplayTime then
+        state.hudDisplayTime = hudTime
+        saveAllToINI()
+        addDebugLog('HUD display time changed to ' .. hudTime .. 's')
+    end
+    tooltip('How long each HUD alert stays on screen (saved)')
+    
+    local hudMax = ImGui.SliderInt('Max Queued Alerts##hudmax', state.hudMaxQueue, 3, 15)
+    if type(hudMax) == 'number' and hudMax ~= state.hudMaxQueue then
+        state.hudMaxQueue = hudMax
+        saveAllToINI()
+        addDebugLog('Max HUD queue changed to ' .. hudMax)
+    end
+    tooltip('Maximum number of alerts that can be queued (saved)')
     
     ImGui.Separator()
     
@@ -617,8 +713,11 @@ local function drawProfilesTab()
 end
 
 local function draw()
-    -- CENTER-SCREEN OVERLAY (always draw first, even if main window closed)
-    if state.centerMessage ~= '' and os.time() < (state.centerUntil or 0) then
+    -- Update HUD queue state (must happen before rendering)
+    updateHUDQueue()
+    
+    -- CENTER-SCREEN HUD (only if active alert exists)
+    if state.activeHUD then
         local io = ImGui.GetIO()
         local x = io.DisplaySize.x / 2
         local y = io.DisplaySize.y * 0.20
@@ -634,15 +733,15 @@ local function draw()
         
         ImGui.SetWindowFontScale(2.5)
         
-        local msg = state.centerMessage or ''
+        local msg = state.activeHUD.msg or ''
         local cx, cy = ImGui.GetCursorPos()
         
         -- Shadow
         ImGui.SetCursorPos(cx + 2, cy + 2)
         ImGui.TextColored(0.0, 0.0, 0.0, 1.0, msg)
         
-        -- Foreground (red for alert)
-        local c = state.centerColor
+        -- Foreground (color from alert)
+        local c = state.activeHUD.color
         ImGui.SetCursorPos(cx, cy)
         ImGui.TextColored(c[1], c[2], c[3], c[4], msg)
         
@@ -703,13 +802,13 @@ local function initialize()
     
     state.currentZone = mq.TLO.Zone.ShortName() or ''
     
-    print('SpawnMonitor v' .. VERSION .. ' initialized')
+    print('NamedCampMonitor v' .. VERSION .. ' initialized')
     print('Current zone: ' .. state.currentZone)
     print('Active profile: ' .. state.currentProfile)
     addDebugLog('Script initialized')
 end
 
-mq.imgui.init('SpawnMonitorUI', draw)
+mq.imgui.init('NamedCampMonitorUI', draw)
 initialize()
 
 while openGUI do
