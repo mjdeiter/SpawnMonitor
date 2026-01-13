@@ -1,11 +1,11 @@
 -- SpawnMonitor.lua
--- v1.6.0 (Increased detection range for zone-wide monitoring)
+-- v1.7.0 (UX Polish: disabled dropdown when armed, unsaved changes highlight, profile loaded banner)
 -- Full featured named camp monitor
 
 local mq = require('mq')
 local ImGui = require('ImGui')
 
-local VERSION = 'v1.6.0'
+local VERSION = 'v1.7.0'
 local INI_FILE = mq.configDir .. '/SpawnMonitor.ini'
 
 -- FSM States for individual nameds
@@ -38,6 +38,10 @@ local state = {
     activeHUD = nil,         -- currently displayed alert {msg, color, expiresAt}
     hudDisplayTime = 4,      -- seconds per alert
     hudMaxQueue = 5,         -- max queued alerts
+    
+    -- UX polish
+    unsavedChanges = false,  -- Track if settings changed since last save
+    profileLoadedTime = 0,   -- Timestamp when profile was loaded (for banner)
 }
 
 local openGUI = true
@@ -113,6 +117,7 @@ local function saveAllToINI()
     if file then
         file:write(table.concat(lines, '\n'))
         file:close()
+        state.unsavedChanges = false  -- Clear unsaved changes flag
         addDebugLog('Settings saved to INI')
         return true
     else
@@ -188,17 +193,35 @@ local function loadProfile(profileName)
 end
 
 local function loadAllProfiles()
-    local iniData = mq.TLO.Ini.File(INI_FILE)
-    if not iniData() then return end
+    -- Read INI file directly to discover all profiles
+    local file = io.open(INI_FILE, 'r')
+    if not file then
+        addDebugLog('No INI file found, using defaults')
+        return
+    end
     
-    for i = 1, 100 do
-        local section = iniData.Section(i)()
-        if not section or section == 'NULL' then break end
-        
-        if section:match('^Profile_') then
-            local profileName = section:gsub('^Profile_', '')
-            loadProfile(profileName)
+    local discoveredProfiles = {}
+    for line in file:lines() do
+        local profileName = line:match('^%[Profile_(.+)%]')
+        if profileName then
+            table.insert(discoveredProfiles, profileName)
         end
+    end
+    file:close()
+    
+    -- Load each discovered profile
+    for _, profileName in ipairs(discoveredProfiles) do
+        loadProfile(profileName)
+        addDebugLog('Loaded profile from INI: ' .. profileName)
+    end
+    
+    -- Ensure default profile exists
+    if not state.profiles['default'] then
+        state.profiles['default'] = {
+            exactList = {},
+            partialList = {}
+        }
+        addDebugLog('Created default profile')
     end
 end
 
@@ -434,8 +457,60 @@ local function drawMonitorTab()
     ImGui.Separator()
     
     ImGui.Text(string.format('Scan Range: %d radius, +/-%d Z', state.radius, state.zRange))
-    ImGui.Text('Profile: ' .. state.currentProfile)
+    
+    -- Profile Dropdown (with UX polish)
+    ImGui.Text('Profile: ')
+    ImGui.SameLine()
+    
+    -- Build profile name list (default always first)
+    local profileNames = {}
+    table.insert(profileNames, 'default')  --  Default always first
+    for name, _ in pairs(state.profiles) do
+        if name ~= 'default' then
+            table.insert(profileNames, name)
+        end
+    end
+    table.sort(profileNames, function(a, b)
+        if a == 'default' then return true end
+        if b == 'default' then return false end
+        return a < b
+    end)
+    
+    -- Find current index
+    local currentIndex = 1
+    for i, name in ipairs(profileNames) do
+        if name == state.currentProfile then
+            currentIndex = i
+            break
+        end
+    end
+    
+    --  Disable dropdown while armed
+    if state.armed then
+        ImGui.PushStyleColor(ImGuiCol.Text, 0.5, 0.5, 0.5, 1.0)
+        ImGui.Text(state.currentProfile)
+        ImGui.PopStyleColor()
+        tooltip('Disarm to change profiles')
+    else
+        -- Dropdown enabled
+        local result = ImGui.Combo('##profilecombo', currentIndex, profileNames, #profileNames)
+        if type(result) == 'number' and result ~= currentIndex and profileNames[result] then
+            state.currentProfile = profileNames[result]
+            loadProfile(state.currentProfile)
+            saveAllToINI()
+            state.profileLoadedTime = os.time()  --  Trigger banner
+            addDebugLog('Switched to profile: ' .. state.currentProfile)
+        end
+        tooltip('Quick switch between profiles')
+    end
+    
     ImGui.Text('Audio: ' .. state.audioAlert)
+    
+    --  Profile Loaded Banner (3 seconds)
+    if os.time() < state.profileLoadedTime + 3 then
+        ImGui.SameLine()
+        ImGui.TextColored(0, 1, 0, 1, '✓ Loaded')
+    end
     
     ImGui.Separator()
     
@@ -518,12 +593,14 @@ local function drawConfigTab()
     local r = ImGui.SliderInt('Radius##radius', state.radius, 50, 5000)
     if type(r) == 'number' and r ~= state.radius then
         state.radius = r
+        state.unsavedChanges = true  --  Mark unsaved
     end
     tooltip('Horizontal detection radius (50-5000 units)')
     
     local z = ImGui.SliderInt('Z Range##zrange', state.zRange, 10, 500)
     if type(z) == 'number' and z ~= state.zRange then
         state.zRange = z
+        state.unsavedChanges = true  --  Mark unsaved
     end
     tooltip('Vertical detection range (10-500 units, for multi-floor zones)')
     
@@ -532,18 +609,25 @@ local function drawConfigTab()
     ImGui.Text('Audio Alert:')
     if ImGui.RadioButton('Beep##beep', state.audioAlert == 'beep') then
         state.audioAlert = 'beep'
+        state.unsavedChanges = true  --  Mark unsaved
     end
     ImGui.SameLine()
     if ImGui.RadioButton('Sound##sound', state.audioAlert == 'sound') then
         state.audioAlert = 'sound'
+        state.unsavedChanges = true  --  Mark unsaved
     end
     ImGui.SameLine()
     if ImGui.RadioButton('None##none', state.audioAlert == 'none') then
         state.audioAlert = 'none'
+        state.unsavedChanges = true  --  Mark unsaved
     end
     
     if state.audioAlert == 'sound' then
+        local oldSound = state.soundFile
         state.soundFile = InputTextValue('Sound File##soundfile', state.soundFile, 64)
+        if state.soundFile ~= oldSound then
+            state.unsavedChanges = true  --  Mark unsaved
+        end
         tooltip('Sound file in MQ/resources/sounds folder')
     end
     
@@ -553,7 +637,7 @@ local function drawConfigTab()
     local hudTime = ImGui.SliderInt('Alert Display Time (sec)##hudtime', state.hudDisplayTime, 2, 10)
     if type(hudTime) == 'number' and hudTime ~= state.hudDisplayTime then
         state.hudDisplayTime = hudTime
-        saveAllToINI()
+        state.unsavedChanges = true  --  Mark unsaved (will save on button click)
         addDebugLog('HUD display time changed to ' .. hudTime .. 's')
     end
     tooltip('How long each HUD alert stays on screen (saved)')
@@ -561,7 +645,7 @@ local function drawConfigTab()
     local hudMax = ImGui.SliderInt('Max Queued Alerts##hudmax', state.hudMaxQueue, 3, 15)
     if type(hudMax) == 'number' and hudMax ~= state.hudMaxQueue then
         state.hudMaxQueue = hudMax
-        saveAllToINI()
+        state.unsavedChanges = true  --  Mark unsaved (will save on button click)
         addDebugLog('Max HUD queue changed to ' .. hudMax)
     end
     tooltip('Maximum number of alerts that can be queued (saved)')
@@ -638,10 +722,22 @@ local function drawConfigTab()
     
     ImGui.Separator()
     
-    if ImGui.Button('Save Settings') then
-        saveAllToINI()
+    --  Highlight Save button if unsaved changes
+    if state.unsavedChanges then
+        ImGui.PushStyleColor(ImGuiCol.Button, 1.0, 0.5, 0.0, 1.0)  -- Orange
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 1.0, 0.6, 0.2, 1.0)
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, 1.0, 0.4, 0.0, 1.0)
+        if ImGui.Button('Save Settings *##save') then
+            saveAllToINI()
+        end
+        ImGui.PopStyleColor(3)
+        tooltip('Unsaved changes! Click to save to INI file')
+    else
+        if ImGui.Button('Save Settings##save') then
+            saveAllToINI()
+        end
+        tooltip('Save all settings and current profile to INI file')
     end
-    tooltip('Save all settings and current profile to INI file')
 end
 
 local function drawProfilesTab()
