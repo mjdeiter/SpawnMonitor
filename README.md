@@ -8,7 +8,8 @@
 **Description:**  
 A full-featured named camp monitor for EverQuest using MQ2 and ImGui. Tracks NPC spawns based on exact or partial name matching, supports multi-named monitoring, audio alerts, and a center-screen HUD overlay for instant notifications.
 
-<img width="562" height="589" alt="image" src="https://github.com/user-attachments/assets/f26c095c-044e-421b-95a5-bb7f5ac70fd3" />
+<img width="465" height="648" alt="image" src="https://github.com/user-attachments/assets/93484bb0-230d-405a-b8a8-5d827662b26d" />
+
 
 ---
 
